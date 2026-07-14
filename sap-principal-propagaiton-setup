@@ -386,6 +386,68 @@ Under SAP ID Service, users were identified by **P-/S-user IDs**. After the swit
 
 ---
 
+## Appendix D — Troubleshooting the SSO login chain (Phase 1 / Verification checkpoint 1)
+
+Diagnose by **where the login flow stops**. Open the Web IDE / cockpit URL in a private browser window and observe the last screen reached.
+
+### D.1 Where to find the IAS tenant metadata
+
+Needed for the Neo trusted-IdP upload (C.3).
+
+- **Direct URL (no login required):** `https://<tenant-id>.accounts.ondemand.com/saml2/metadata` → save the returned XML.
+- **Via admin console:** IAS admin console → **Tenant Settings** (gear icon, top right) → **SAML 2.0 Configuration** → download the SAML metadata. This screen also shows the tenant **Entity ID** and SSO endpoints for manual configuration.
+- **Don't know the tenant ID?** Trigger any IAS login and read the hostname from the browser address bar during the IAS screen — that hostname *is* the tenant.
+- Note: the *tenant* metadata is what Neo needs. The application-specific configuration inside IAS (Applications → your Neo app) is a separate object and is not uploaded to Neo.
+
+### D.2 Flow stops at SAP ID Service (`accounts.sap.com`)
+
+The Neo subaccount is still using its default identity provider. → See **Appendix C** (switch Local Service Provider to Custom, register IAS as trusted IdP).
+
+### D.3 Flow reaches IAS but shows the IAS login form instead of forwarding to Entra ID
+
+**Cause:** in IAS, forwarding to a corporate IdP is configured **per application** via Conditional Authentication. A tenant-wide Entra↔IAS federation does *not* automatically apply to a newly created application (such as the one registered for the Neo subaccount in C.2).
+
+Check in this order:
+
+1. IAS admin console → **Applications & Resources → Applications** → open the Neo subaccount application → **Conditional Authentication**:
+   - **Default Identity Provider** must be explicitly set to the Entra ID corporate IdP.
+   - If conditional rules exist (group, IP range, e-mail domain), verify one actually matches the test user — an overly narrow rule falls through silently to the IAS login page.
+2. IAS admin console → **Identity Providers → Corporate Identity Providers** → the Entra ID entry:
+   - Status must be **Active**.
+   - Check whether the corporate IdP is scoped to specific applications only; if so, the Neo application must be included.
+3. After changing this, always retest in a **fresh private window** — IAS remembers the IdP choice for the session.
+
+If, after setting the default IdP, IAS presents a *choice* between the corporate IdP and e-mail/password rather than redirecting automatically: that is working as designed (IAS's own user store is still offered as an option for this application). Select the corporate IdP for testing, and restrict the IAS user store for this application once the setup is confirmed.
+
+### D.4 Entra login succeeds, then error `AADSTS50011: The reply URL ... does not match the reply URLs configured for the application`
+
+**Cause:** Entra only ever talks to **IAS** — it never sees the Neo subaccount. The Reply URL it needs registered is IAS's Assertion Consumer Service endpoint, and the exact endpoint IAS uses may not yet be in Entra's list.
+
+Fix:
+
+1. Copy the reply URL **verbatim** from the error message. IAS ACS endpoints follow the pattern:
+   `https://<tenant>.accounts.ondemand.com/saml2/idp/acs/<tenant>.accounts.ondemand.com`
+   (the doubled tenant name is correct — do not reconstruct the URL from memory, copy it).
+2. Entra admin center → **Enterprise Applications** → the SAP Cloud Identity Services / IAS application → **Single sign-on → Basic SAML Configuration → Edit**.
+3. Add the URL from step 1 under **Reply URL (Assertion Consumer Service URL)**. Multiple reply URLs are allowed — keep the existing entries.
+4. While in this screen, confirm the **Identifier (Entity ID)** matches what IAS sends (a mismatch there produces `AADSTS650056` instead).
+5. Save, allow a minute for propagation, retest in a fresh private window.
+
+**Custom domain caveat:** if IAS is configured with a custom domain (e.g. `login.company.com`), the ACS URL in the error will use that host instead of `<tenant>.accounts.ondemand.com`. Register the variant actually in use — and standardize on one to avoid recurring mismatches.
+
+### D.5 Entra login succeeds, lands in Neo, but "not authorized" / no Web IDE access
+
+SSO works — this is an **authorization** gap, not an authentication one. The federated user arrives as the UPN (`Michael.Pwirmal@menteros.gr`), which Neo treats as a different user than the former P-/S-user. → See **C.4**: assign the Web IDE permission and cockpit roles to the new identity.
+
+### D.6 Running IAS and SAP ID Service in parallel during the transition
+
+- Multiple trusted identity providers may be active on a Neo subaccount simultaneously.
+- With **one** trusted IdP configured, users are redirected to it silently. With **more than one**, Neo shows an **IdP selection page** where the user picks the provider.
+- Keeping SAP ID Service trusted alongside IAS is a useful safety net while testing (and protects against lockout), but it is a **bypass of Entra ID's conditional access/MFA** and allows two parallel identities per person (P-user vs. UPN) with potentially different authorizations.
+- **Retire it deliberately:** once the Entra/IAS path is confirmed for all users, remove or deactivate the SAP ID Service trust entry so exactly one login path remains.
+
+---
+
 ## Appendix B — Environment-specific values to fill in
 
 | Placeholder | Your value |
