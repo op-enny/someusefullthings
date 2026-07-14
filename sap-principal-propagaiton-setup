@@ -336,6 +336,56 @@ Diagnose strictly in flow order — each layer's log tells you whether the ident
 | Session check | SM04 / AL08 |
 | User e-mail | SU01 → Address tab |
 
+## Appendix C — Neo subaccount still using accounts.sap.com instead of IAS/Entra
+
+**Symptom:** Entra ID and IAS are federated, but the Neo BTP / classic Web IDE Full-Stack login screen shows **SAP ID Service (`accounts.sap.com`)** instead of redirecting through IAS to Entra ID.
+
+**Root cause:** on Neo, Entra↔IAS federation is not enough by itself. The subaccount's **Local Service Provider** must be switched from its default configuration (which always uses SAP ID Service) to **Custom**, and IAS must then be registered as the subaccount's trusted identity provider. This is a separate, Neo-specific trust hop on top of the Entra↔IAS federation, and it is easy to skip.
+
+### C.1 Switch the Local Service Provider to Custom
+
+1. Neo cockpit → subaccount → **Security → Trust → Local Service Provider** tab.
+2. **Edit** → Configuration Type: change from `Default` to **Custom**.
+3. **Generate Key Pair** if none exists yet.
+4. **Principal Propagation: Enabled** (required later for the Cloud Connector scenario, so enable it now).
+5. **Save**, then **Get Metadata** → download the resulting SP metadata XML.
+
+### C.2 Register the Neo subaccount as an application in IAS
+
+1. IAS admin console → **Applications & Resources → Applications → Create**.
+2. **SAML 2.0 Configuration** → upload the SP metadata XML from C.1 (auto-fills ACS endpoint, entity ID, signing certificate).
+3. **Subject Name Identifier: Login Name** (carries the UPN, e.g. `Michael.Pwirmal@menteros.gr`, consistent with the identifier strategy used in this manual).
+4. **Conditional Authentication → Default Identity Provider:** select the Entra ID corporate IdP. ← Easy to miss: this is a *per-application* setting in IAS. Federating Entra with IAS elsewhere does not make this application forward to Entra automatically.
+5. Download the IAS tenant metadata: `https://<tenant>.accounts.ondemand.com/saml2/metadata`.
+
+### C.3 Add IAS as trusted identity provider in Neo
+
+1. Neo cockpit → **Security → Trust → Application Identity Provider** tab → **Add Trusted Identity Provider**.
+2. Upload the IAS tenant metadata from C.2.5.
+3. **Attributes** tab → map assertion attributes:
+   - `mail` → `email`
+   - `first_name` → `firstname`
+   - `last_name` → `lastname`
+4. Save.
+
+### C.4 Re-map authorizations to the new identity — do this before/immediately after the cutover
+
+Under SAP ID Service, users were identified by **P-/S-user IDs**. After the switch, the same people arrive as their **UPN/email** (e.g. `Michael.Pwirmal@menteros.gr`) — an entirely different user ID as far as Neo is concerned.
+
+1. Neo cockpit → **Security → Authorizations** (and **Members**): add each user under the **new identity (UPN/email)** and (re-)assign their roles — at minimum the Web IDE permission (`WebIDEPermission` / DiDeveloper role) and any cockpit admin roles they previously had under the P-/S-user.
+2. ⚠️ **Lockout protection:** add the admin role for at least one user under the new identity *before* flipping Local Service Provider to Custom (C.1 step 2), or confirm you can still reach the subaccount trust settings via the global account level if something goes wrong.
+3. This is a subaccount-wide, immediate cutover — all users are affected the moment Custom is saved. Communicate a cutover time to active developers.
+4. Optional transition safety net: keep SAP ID Service selectable as a fallback IdP during initial testing, then remove it once Entra/IAS login is confirmed working, so there is exactly one login path going forward.
+
+### C.5 Test
+
+1. Private/incognito browser window → open the Web IDE URL.
+2. Expected chain: redirect to IAS → redirect to Entra ID → back into Web IDE, logged in.
+3. Confirm the user ID shown in the Web IDE user menu / Neo cockpit is the UPN, e.g. `Michael.Pwirmal@menteros.gr`.
+4. This confirmed string is exactly **Verification checkpoint 1** in Phase 1 of this manual — once it matches, proceed to Phase 2 (Cloud Connector) unchanged.
+
+---
+
 ## Appendix B — Environment-specific values to fill in
 
 | Placeholder | Your value |
