@@ -1,0 +1,353 @@
+# Principal Propagation Setup Manual
+## Entra ID → SAP Cloud Identity Services → SAP BTP / Web IDE → Cloud Connector → On-Premise ABAP
+
+**Scenario:** End-to-end single sign-on with identity propagation, so that requests from SAP Web IDE / Business Application Studio reach the on-premise ABAP system under the *named business user*, not a technical user.
+
+**Confirmed starting state for this environment:**
+
+| Item | Status |
+|---|---|
+| Entra ID ↔ IAS federation | Already established |
+| SU01 e-mail addresses | Maintained, unique, mixed case (e.g. `Michael.Pwirmal@menteros.gr`) |
+| Entra ID login name (UPN) | Matches SU01 e-mail exactly, character for character |
+| Entra ID mail attribute | Lowercase variant (`michael.pwirmal@menteros.gr`) |
+| USREXTID (type DN) | Empty — no legacy explicit mappings |
+| Mapping strategy | Single CERTRULE rule: CN → E-Mail |
+| Certificate subject pattern | `CN=${name}` (UPN as identifier) |
+
+**Identity flow being built:**
+
+```
+Browser ──▶ Entra ID ──▶ IAS ──▶ BTP subaccount / Web IDE
+                                        │  (Destination: PrincipalPropagation)
+                                        ▼
+                               SAP Cloud Connector
+                                        │  (short-lived X.509 cert, CN = user)
+                                        ▼
+                               On-prem ABAP (ICM → CERTRULE → SU01 user)
+```
+
+**Golden rule:** the user identifier must survive every hop *unchanged*. In this setup the canonical identifier is the UPN / login name, e.g. `Michael.Pwirmal@menteros.gr`.
+
+---
+
+## Phase 0 — Prerequisites and access checklist
+
+Before starting, confirm you have:
+
+- [ ] Administrator access to the **IAS admin console** (`https://<tenant>.accounts.ondemand.com/admin`)
+- [ ] **BTP cockpit** access with Security Administrator role on the subaccount
+- [ ] **Cloud Connector** installed on-premise, admin access to `https://<cc-host>:8443`
+- [ ] Outbound HTTPS (443) from the Cloud Connector host to the BTP region host (no inbound ports required)
+- [ ] ABAP authorizations: STRUST, RZ10/RZ11, SMICM, CERTRULE, SICF, SM30, SU01 display
+- [ ] The ABAP system's **HTTPS port active** (SMICM → Goto → Services; if no HTTPS service exists, it must be configured first — parameter `icm/server_port_<n> = PROT=HTTPS,PORT=443<xx>` plus an SSL server PSE in STRUST)
+- [ ] A maintenance window for one **ICM restart**
+- [ ] Decision recorded: subaccount type is **Neo (classic SAP Web IDE Full-Stack)** or **Cloud Foundry (Business Application Studio)**. Steps differ only in Phase 1 and Phase 5; both variants are documented below.
+
+---
+
+## Phase 1 — Trust between IAS and the BTP subaccount
+
+### Variant A: Cloud Foundry subaccount (Business Application Studio)
+
+1. BTP cockpit → subaccount → **Security → Trust Configuration**.
+2. Click **Establish Trust** and select the IAS tenant.
+   - If IAS and the global account share the same customer ID, the tenant appears in the dropdown and trust is created automatically (OIDC- or SAML-based).
+   - If not listed: download the IAS tenant SAML metadata (`https://<tenant>.accounts.ondemand.com/saml2/metadata`), create the trust manually via **New SAML Trust Configuration**, then register the subaccount as an application in IAS using the subaccount's SAML metadata (Trust Configuration → SAML Metadata download).
+3. In the **IAS admin console → Applications**, open the application that was created for the subaccount:
+   - **Subject Name Identifier:** set to **Login Name** (this carries the UPN forwarded from Entra ID). If IAS runs in pure proxy mode, verify the NameID from Entra is passed through unchanged.
+   - **Default Name ID Format:** Unspecified or E-Mail — must be consistent with what the subaccount expects; Unspecified is the safe default.
+   - **Assertion Attributes:** ensure `mail`, `first_name`, `last_name` are mapped; add `Groups` if role mapping by group is planned.
+4. Conditional Authentication: confirm the corporate IdP (Entra ID) is the target for your user domain.
+5. Optional hardening: in BTP Trust Configuration, set the **Default identity provider (SAP ID Service)** to *Available for user logon = false* so users cannot bypass Entra ID.
+
+### Variant B: Neo subaccount (classic SAP Web IDE Full-Stack)
+
+1. Neo cockpit → subaccount → **Security → Trust**.
+2. Tab **Local Service Provider**:
+   - Configuration Type: **Custom**
+   - Generate/confirm a signing key pair.
+   - **Principal Propagation: Enabled** ← Neo-specific switch; without it the identity is not handed to the connectivity service.
+   - Save, then **Get Metadata** (download the SP metadata).
+3. Tab **Application Identity Provider → Add Trusted Identity Provider**:
+   - Upload the IAS tenant metadata.
+   - Attribute mappings: `mail → email`, `first_name → firstname`, `last_name → lastname`.
+4. In the **IAS admin console**, create/verify the application for this Neo subaccount (upload the SP metadata from step 2) and set **Subject Name Identifier = Login Name** as in Variant A.
+
+### Verification checkpoint 1
+
+1. Open the BTP cockpit / Web IDE URL in a fresh browser session (private window).
+2. Expected chain: redirect to IAS → redirect to Entra ID login → back to the application, logged in.
+3. **Record the exact user ID string shown in the cockpit/user menu.** Expected: `Michael.Pwirmal@menteros.gr` (mixed case, matching SU01).
+4. ⚠️ Do not proceed to Phase 3 until this string is confirmed — it is the value that will be stamped into every short-lived certificate.
+
+---
+
+## Phase 2 — Cloud Connector: subaccount connection and access control
+
+### 2.1 Connect the subaccount
+
+1. Log in to the Cloud Connector admin UI: `https://<cc-host>:8443` (default initial user `Administrator` / `manage`, change on first login).
+2. **Connector → Add Subaccount:**
+   - Region: your BTP region host (e.g. `cf.eu10.hana.ondemand.com` for CF, `hana.ondemand.com` for Neo)
+   - Subaccount: the subaccount ID (CF) or subaccount name (Neo)
+   - Credentials: a user with the *Cloud Connector Administrator* role collection (CF) or admin rights (Neo). Certificate-based subaccount authentication is also possible and recommended for production.
+3. Confirm the tunnel status shows **Connected** (green).
+
+### 2.2 Map the ABAP system (Access Control)
+
+1. **Cloud To On-Premise → Access Control → Add** (with the correct subaccount selected top-right):
+   - Back-end Type: **ABAP System**
+   - Protocol: **HTTPS** ← mandatory for principal propagation; the short-lived certificate travels via mutual TLS to the backend
+   - Internal Host / Port: the real ABAP hostname and its HTTPS port (from SMICM → Services, e.g. `s4hprd.internal.menteros.gr : 44300`)
+   - Virtual Host / Port: an alias exposed to the cloud, e.g. `s4v : 44300` (never expose the real hostname)
+   - Principal Type: **X.509 Certificate (general usage)**
+   - Host verification: *Trust checked* once the backend TLS certificate is trusted (see 3.5); for initial testing "Use Virtual Host as Request Host" per your TLS setup.
+2. **Add Resources** under the new mapping:
+   - `/sap/opu/odata` — Path and all sub-paths — Active
+   - `/sap/bc` — Path and all sub-paths — Active
+   - (tighten to specific service paths for production)
+
+### Verification checkpoint 2
+
+The mapping shows **Reachable** (green status) in the Access Control list. If unreachable: check DNS/firewall from the CC host to the ABAP HTTPS port (`openssl s_client -connect s4hprd...:44300` from the CC host is a quick test).
+
+---
+
+## Phase 3 — Cloud Connector: principal propagation configuration
+
+### 3.1 Trust the identity provider
+
+1. **Cloud To On-Premise → Principal Propagation** tab.
+2. Click **Synchronize** — pulls the list of trust configurations from the subaccount.
+3. Mark the IAS/Entra trust entry as **Trusted** (checkbox). Leave untrusted IdPs unchecked.
+
+### 3.2 System certificate (authenticates the Cloud Connector to the ABAP ICM)
+
+1. **Configuration → On Premise → System Certificate**.
+2. **Create and import a certificate:**
+   - Preferred: *Generate a Certificate Signing Request* → subject e.g. `CN=scc.menteros.gr, OU=IT, O=Menteros, C=GR` → have it signed by the internal corporate PKI → import the signed cert + chain.
+   - PoC alternative: *Create and import a self-signed certificate*.
+3. Record the exact **Subject** and **Issuer** strings of this certificate — they are needed verbatim in Phase 4.2.
+
+### 3.3 CA certificate (signs the short-lived user certificates)
+
+1. **Configuration → On Premise → CA Certificate**.
+2. Create a self-signed CA (typical for this purpose, e.g. `CN=SCC-PP-CA, O=Menteros, C=GR`) or import a dedicated sub-CA from the corporate PKI.
+   - Note: this CA signs certificates valid for minutes; it does not need to chain to a public root, only to be trusted by the ABAP system (Phase 4.1).
+
+### 3.4 Subject pattern
+
+1. **Configuration → On Premise → Principal Propagation** section.
+2. Subject Pattern: `CN=${name}`
+   - `${name}` resolves to the principal's login name / NameID as asserted by IAS — for this environment: `Michael.Pwirmal@menteros.gr`.
+   - Certificate validity: default 10 minutes is fine; do not extend unnecessarily.
+
+### 3.5 Trust the backend TLS certificate (CC → ABAP direction)
+
+1. Export the ABAP system's SSL server certificate (STRUST → SSL Server Standard → own certificate → Export, or via browser from the HTTPS port).
+2. Import it in the Cloud Connector under **Configuration → On Premise → Trust Store** (or enable trusting all, PoC only).
+
+### 3.6 Generate the sample certificate
+
+1. In the Principal Propagation section, click **Create Sample Certificate**.
+2. CN value: enter the *exact* string recorded in Verification checkpoint 1 — `Michael.Pwirmal@menteros.gr`.
+3. Save the generated file (`.der`) — required for CERTRULE in Phase 4.3.
+
+### Verification checkpoint 3
+
+Open the sample certificate (double-click on Windows, or `openssl x509 -inform der -in sample.der -noout -subject -issuer`).
+Expected: `subject= CN=Michael.Pwirmal@menteros.gr`, issuer = the CA from 3.3. Case must match SU01 record intent. **This is the single most valuable checkpoint of the whole project.**
+
+---
+
+## Phase 4 — On-premise ABAP system configuration
+
+### 4.1 STRUST — trust the Cloud Connector
+
+1. Transaction **STRUST** → switch to change mode.
+2. Open **SSL Server Standard** PSE (the one bound to the HTTPS port used in Phase 2.2).
+3. **Import** into the certificate list:
+   - The Cloud Connector **system certificate** (from 3.2) — export it in the CC UI first
+   - The Cloud Connector **CA certificate** (from 3.3)
+   - Any intermediate/root of the system certificate's chain, if PKI-signed
+4. **Add to Certificate List**, then **Save**.
+
+### 4.2 ICM profile parameters — trust the intermediary
+
+1. Transaction **RZ10** → instance profile → Extended Maintenance.
+2. Add / verify:
+
+```
+icm/HTTPS/verify_client = 1
+```
+(1 = client certificate accepted if presented; do not use 2 unless every caller on this port has a cert)
+
+3. For **NetWeaver 7.53 and higher** (S/4HANA 1809+):
+
+```
+icm/trusted_reverse_proxy_0 = SUBJECT="CN=scc.menteros.gr, OU=IT, O=Menteros, C=GR", ISSUER="CN=<issuer of system cert>"
+```
+
+For **releases below 7.53**:
+
+```
+icm/HTTPS/trust_client_with_subject = CN=scc.menteros.gr, OU=IT, O=Menteros, C=GR
+icm/HTTPS/trust_client_with_issuer  = CN=<issuer of system cert>
+```
+
+   - ⚠️ Copy SUBJECT and ISSUER **verbatim from the certificate** (Phase 3.2 record). Attribute order, spacing after commas, and case must match exactly. Do not retype from memory.
+4. Save and activate the profile.
+5. **Restart the ICM** (maintenance window): SMICM → Administration → ICM → Exit Soft → with restart. (A full instance restart also works.)
+6. Verify parameters are live: **RZ11** → enter parameter name → check current value.
+
+### 4.3 CERTRULE — the mapping rule
+
+1. Transaction **CERTRULE** → switch to change mode.
+2. **Import certificate** → select the sample certificate file from Phase 3.6.
+3. **Rule** button → create:
+   - Certificate attribute: **CN**
+   - Login as: **E-Mail**
+   - (no filters needed)
+4. The status display must show:
+   - Certificate status: green — *mapped to user*
+   - Resolved user: Michael's SU01 user ID
+5. **Save** (customizing transport prompt may appear depending on client settings).
+6. Because USREXTID is empty in this system, this rule is the sole mapping authority. Keep it that way — do not add explicit USREXTID/VUSREXTID entries later.
+
+> Note on case: the CERTRULE e-mail lookup is effectively case-insensitive (it matches via the uppercase search field of the address). The UPN-based CN chosen here matches SU01 exactly anyway, giving double safety.
+
+### 4.4 SICF — allow certificate logon
+
+1. Transaction **SICF** → locate the target services (e.g. `/default_host/sap/opu/odata`, `/default_host/sap/bc/ping`).
+2. Service → **Logon Data** tab → Procedure: **Standard** (which includes *Logon Through SSL Certificate* in the logon order) — verify certificate logon is not excluded.
+3. Ensure the services are **activated**.
+
+### Verification checkpoint 4
+
+From the Cloud Connector host, the TLS handshake to the ABAP HTTPS port succeeds and the server requests/accepts a client certificate:
+`openssl s_client -connect <abap-host>:44300 -cert <cc-system-cert> ...` — or simply proceed to Phase 6 and rely on the traces there.
+
+---
+
+## Phase 5 — Destination in BTP
+
+### Variant A: Cloud Foundry (Business Application Studio)
+
+1. BTP cockpit → subaccount → **Connectivity → Destinations → New Destination**:
+
+| Property | Value |
+|---|---|
+| Name | `S4H_PP` (example) |
+| Type | HTTP |
+| URL | `http://s4v:44300` |
+| Proxy Type | **OnPremise** |
+| Authentication | **PrincipalPropagation** |
+
+2. Additional Properties:
+
+| Property | Value |
+|---|---|
+| `sap-client` | `<client>`, e.g. `100` |
+| `WebIDEEnabled` | `true` |
+| `WebIDEUsage` | `odata_abap,dev_abap` |
+| `HTML5.DynamicDestination` | `true` |
+
+3. Save → **Check Connection**. Expected result: reachable (a `401` here is normal — the connection check sends no principal).
+
+### Variant B: Neo (classic SAP Web IDE Full-Stack)
+
+Same properties, created under Neo cockpit → **Connectivity → Destinations**. `WebIDEUsage=odata_abap,dev_abap` plus `WebIDESystem=<SID>` is the classic property set. Ensure the Web IDE subscription and the destination live in the same subaccount.
+
+> Note: the URL uses the **virtual host** and typically `http://` — the tunnel carries it; the CC↔ABAP leg is the HTTPS connection configured in Phase 2.2.
+
+---
+
+## Phase 6 — End-to-end test
+
+1. Fresh browser session → open Web IDE / BAS → SSO chain via Entra ID (no password prompt if the Windows session is already Entra-joined, otherwise Entra login).
+2. Create a project **from an OData service** (Service Catalog → select the `S4H_PP` destination) or open the service URL through the destination.
+3. **Expected: no basic-authentication popup at any point.** The catalog lists services, the project generates.
+4. Definitive proof on the ABAP side: transaction **SM04** (or AL08) on the backend — the HTTP session runs under **Michael's SU01 user**, not a technical user.
+5. Repeat with a second user to confirm the rule (not a fluke mapping) is doing the work.
+
+---
+
+## Phase 7 — Troubleshooting guide
+
+Diagnose strictly in flow order — each layer's log tells you whether the identity survived that hop.
+
+### 7.1 Symptom: basic-auth popup in Web IDE
+
+- Destination Authentication not `PrincipalPropagation`, or the Neo *Principal Propagation = Enabled* switch (Phase 1, Variant B) is off, or the IdP is not marked trusted in the CC (Phase 3.1).
+
+### 7.2 Cloud Connector layer
+
+1. CC admin UI → **Log And Trace Files** → set *Cloud Connector Loggers* to DEBUG; optionally enable *Payload Trace* for the subaccount.
+2. Reproduce, then check `ljs_trace.log`:
+   - Was a short-lived certificate issued?
+   - What is its **subject CN**? Must be `CN=Michael.Pwirmal@menteros.gr`.
+   - Wrong/empty CN → subject pattern (3.4) or the identifier forwarded by IAS (checkpoint 1) is off.
+3. `403 Forbidden` logged from the backend → continue at 7.3.
+4. Remember to reset trace levels afterwards.
+
+### 7.3 ICM layer (ABAP)
+
+1. **SMICM** → Goto → Trace Level → set 2 (temporarily). Reproduce. Goto → Trace File → Display All.
+2. Look for the incoming request on the HTTPS port:
+   - Client certificate received? Forwarded intermediary cert accepted?
+   - `HTTP 403` with certificate rejection → the `trusted_reverse_proxy` (or `trust_client_with_*`) SUBJECT/ISSUER strings do not exactly match the CC system certificate. Re-copy both strings from the certificate (openssl or STRUST display) into the profile, restart ICM.
+   - No certificate in the request at all → protocol in CC Access Control is HTTP instead of HTTPS (Phase 2.2), or `verify_client = 0`.
+3. Reset trace level to 1 afterwards.
+
+### 7.4 Mapping layer
+
+1. Extract the actual short-lived cert from the CC trace (payload trace) or regenerate the sample cert with the CN observed in 7.2.
+2. **CERTRULE** → import it:
+   - Red / "no user found" → no SU01 user carries that e-mail, or e-mail differs. Fix SU01 or the identifier.
+   - Maps to the **wrong user** → duplicate e-mail in SU01 (SE16 on USR21/ADR6 to hunt duplicates).
+   - Rule not applied at runtime but green in CERTRULE → check the rule is active/saved and transported to the right client; confirm USREXTID (type DN) is still empty (SE16).
+
+### 7.5 Frequent root causes, ranked
+
+1. `trusted_reverse_proxy` SUBJECT/ISSUER string mismatch (typo, attribute order, retyped instead of copied).
+2. Identifier drift: IAS forwards a different NameID than expected (checkpoint 1 skipped).
+3. CC Access Control mapping created with protocol HTTP instead of HTTPS.
+4. ICM not restarted after profile change (RZ11 shows the old value).
+5. SICF service excludes certificate logon.
+6. Missing CA certificate in STRUST (system cert imported, CA forgotten).
+
+---
+
+## Appendix A — Parameter and transaction quick reference
+
+| Purpose | Where |
+|---|---|
+| IAS admin console | `https://<tenant>.accounts.ondemand.com/admin` |
+| CC admin UI | `https://<cc-host>:8443` |
+| Trust config (CF) | BTP cockpit → Security → Trust Configuration |
+| Trust config (Neo) | Neo cockpit → Security → Trust |
+| Certificate trust store | STRUST |
+| Profile parameters | RZ10 / RZ11 |
+| ICM monitor & trace | SMICM |
+| Mapping rules | CERTRULE |
+| Explicit mappings (keep empty) | SM30 → VUSREXTID (work area DN) |
+| Service config | SICF |
+| Session check | SM04 / AL08 |
+| User e-mail | SU01 → Address tab |
+
+## Appendix B — Environment-specific values to fill in
+
+| Placeholder | Your value |
+|---|---|
+| IAS tenant | `__________.accounts.ondemand.com` |
+| BTP region / subaccount | `__________` |
+| CC host | `__________` |
+| ABAP internal host : HTTPS port | `__________ : 443__` |
+| Virtual host : port | `s4v : 44300` (or your choice) |
+| CC system cert subject | `__________` (record verbatim) |
+| CC system cert issuer | `__________` (record verbatim) |
+| Subject pattern | `CN=${name}` |
+| CERTRULE rule | CN → E-Mail |
+| Destination name | `__________` |
+| sap-client | `__________` |
